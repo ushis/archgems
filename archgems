@@ -460,7 +460,7 @@ build() {{
                                             depends=depends,
                                             source=gem_url,
                                             file=basename(gem_url)))
-    except OSError:
+    except IOError:
       raise PackageError('Could not create PKGBUILD: {}'.format(pkgbuild))
 
     try:
@@ -706,10 +706,7 @@ class Archgems:
           except ArchgemsError as e:
             Log.log('[Err] {}'.format(e.message))
 
-        try:
-          todo.update({d for d in depends if d not in gems})
-        except KeyError:
-          pass
+        todo.update({d for d in depends if d not in gems})
 
   @staticmethod
   def shutdown(status=0):
