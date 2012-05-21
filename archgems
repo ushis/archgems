@@ -437,7 +437,7 @@ build() {{
 
     pkgbuild = join(builddir, Package.PKGBUILD)
     depends = ' '.join(['ruby-{}'.format(gem) for gem in depends])
-    info = info if len(info) < 50 else info[:47] + '...'
+    info = (info if len(info) < 50 else info[:47] + '...').replace('\'', '')
 
     try:
       with open(pkgbuild, 'w') as f:
