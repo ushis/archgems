@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+
+from os import chdir, makedirs, getcwd
+from os.path import basename, dirname, expanduser, isdir, isfile, join
+from re import compile as compile_pattern
+from time import strftime
+from glob import iglob
+from shutil import Error as ShutilError, move, rmtree
+from json import loads as parse
+from tarfile import open as open_tarfile, TarError
+from tempfile import mkdtemp
+from threading import Thread
+from subprocess import call
+from urllib.request import urlopen
+from distutils.version import LooseVersion
+from configparser import ConfigParser, Error as ConfigParserError
+
+class ArchgemsError(Exception):
+  '''
+  Base error for archgems
+  '''
+
+  def __init__(self, message):
+    '''
+    Initializes the exception and sets the error message.
+
+    - message is the error message
+    '''
+    super().__init__()
+    self.message = message
+
+  def __str__():
+    '''
+    Returns the error message.
+    '''
+    return self.message
+
+
+class ConfigError(ArchgemsError):
+  '''
+  Handles config errors.
+  '''
+  pass
+
+
+class Config:
+  '''
+  Wraps configparser.ConfigParser
+  '''
+
+  #: Default path of the archgems config file
+  CONFIG = expanduser(join('~', '.config', 'archgems'))
+
+  #: Datatypes
+  TYPES = {
+    'scripts': {
+      'makepkg': str,
+      'repo-add': str
+    },
+    'repo': {
+      'path': str,
+      'name': str,
+      'gems': list,
+      'sign': bool,
+      'signdb': bool
+    }
+  }
+
+  #: The ConfigParser instance
+  _parser = ConfigParser()
+
+  @staticmethod
+  def init(path=CONFIG):
+    '''
+    Loads and parses the config file.
+
+    - path is the path to config file
+    '''
+    try:
+      with open(path) as f:
+        Config._parser.read_file(f)
+    except (IOError, ConfigParserError):
+      raise ConfigError('Could not load config file: {}'.format(path))
+
+  @staticmethod
+  def get(path, default=None):
+    '''
+    Returns a config value or a default value on error.
+
+    - path is a dot separated config path
+    - default is a fallback value
+    '''
+    parts = path.split('.')
+
+    try:
+      t = Config.TYPES[parts[0]][parts[1]]
+    except KeyError:
+      t = str
+
+    try:
+      if t is bool:
+        return Config._parser.getboolean(parts[0], parts[1])
+
+      if t is int:
+        return Config._parser.getint(parts[0], parts[1])
+
+      if t is float:
+        return Config._parser.getfloat(parts[0], parts[1])
+
+      if t is list:
+        return Config._parser.get(parts[0], parts[1]).split()
+
+      return Config._parser.get(parts[0], parts[1])
+    except (KeyError, ConfigParserError):
+      return default
+
+
+class LogError(ArchgemsError):
+  '''
+  Handles log errors.
+  '''
+  pass
+
+
+class Log:
+  '''
+  A simple logger.
+  '''
+
+  #: Relative path to the log directory
+  LOGDIR = '.archgems'
+
+  #: Name of the log file
+  LOGFILE = 'log'
+
+  #: Name of the buildlog directory
+  BUILDLOGDIR = 'buildlog'
+
+  #: Log file instance
+  _file = None
+
+  @staticmethod
+  def init():
+    '''
+    '''
+    logdir = join(Config.get('repo.path'), Log.LOGDIR)
+
+    try:
+      makedirs(logdir, mode=0o755, exist_ok=True)
+    except OSError:
+      raise LogError('Could not create log dir: {}'.format(logdir))
+
+    logfile = join(logdir, Log.LOGFILE)
+
+    try:
+      Log._file = open(logfile, 'a')
+    except IOError:
+      raise LogError('Could not open log file: {}'.format(logfile))
+
+  @staticmethod
+  def log(message):
+    '''
+    Logs a message.
+
+    - message is the message we want to log
+    '''
+    try:
+      Log._file.write('[{}] {}\n'.format(strftime('%Y-%m-%d %H:%M'), message))
+    except IOError:
+      pass
+
+  @staticmethod
+  def close():
+    '''
+    Closes the log file.
+    '''
+    try:
+      Log._file.close()
+    except:
+      pass
+
+  @staticmethod
+  def store_buildlog(pkgname, path):
+    '''
+    '''
+    buildlogdir = join(Config.get('repo.path'), Log.LOGDIR, Log.BUILDLOGDIR, pkgname)
+
+    try:
+      makedirs(buildlogdir, mode=0o755, exist_ok=True)
+    except OSError:
+      raise LogError('Could not create buildlog dir: {}'.format(buildlogdir))
+
+    for f in iglob(join(path, '*.log')):
+      try:
+        move(f, buildlogdir)
+      except ShutilError:
+        raise LogError('Could not move build into log dir: {} -> {}'.format(f, buildlogdir))
+
+
+class SysCallError(ArchgemsError):
+  '''
+  Handles system call errors.
+  '''
+  pass
+
+
+class SysCall:
+  '''
+  Wraps system calls.
+  '''
+
+  #: Default path to makepkg
+  MAKEPKG = '/usr/bin/makepkg'
+
+  #: Default path to repo-add
+  REPO_ADD = '/usr/bin/repo-add'
+
+  @staticmethod
+  def call(cmd):
+    '''
+    Calls a command
+
+    - cmd is the command we want to call.
+    '''
+    if call(cmd) is not 0:
+      raise SysCallError('An error occurred while running: {}'.format(' '.join(cmd)))
+
+  @staticmethod
+  def makepkg(path):
+    '''
+    Calls makepkg.
+
+    - path is the path to PKGBUILD directory.
+    '''
+    cwd = getcwd()
+
+    try:
+      chdir(path)
+    except:
+      raise SysCallError('Could not change dir: {}'.format(path))
+
+    cmd = [Config.get('scripts.makepkg', SysCall.MAKEPKG), '-d', '-L', '-m']
+
+    #### FIXME Remove the following line!
+    cmd.append('--skipinteg')
+
+    if Config.get('repo.sign', False):
+      cmd.append('--sign')
+
+    SysCall.call(cmd)
+
+    try:
+      chdir(cwd)
+    except:
+      raise SysCallError('Could not change dir: {}'.format(cwd))
+
+  @staticmethod
+  def repo_add(db_path, pkg_path):
+    '''
+    Calls repo-add.
+
+    - db_path is the path to the repo database
+    - pkg_path is the path to the package
+    '''
+    cmd = [Config.get('scripts.repo-add', SysCall.REPO_ADD), db_path, pkg_path]
+
+    if Config.get('repo.signdb', False):
+      cmd += ['--verify', '--sign']
+
+    SysCall.call(cmd)
+
+class RubygemsRequestError(ArchgemsError):
+  '''
+  Handles rubygems request errors.
+  '''
+  pass
+
+
+class RubygemsRequest(Thread):
+  '''
+  Handles parallel requests against the rubygems API.
+  '''
+
+  #: Uri of the rubygems api
+  API = 'https://rubygems.org/api/v1/gems/{gem}.json'
+
+  @staticmethod
+  def forge(gems):
+    '''
+    Forges some parallel requests.
+
+    - gems is a list of gem names we want some info about.
+    '''
+    requests = []
+
+    for gem in gems:
+      r = RubygemsRequest(gem)
+      requests.append(r)
+      r.start()
+
+    results, errors = [], []
+
+    for r in requests:
+      r.join()
+
+      if r.error is not None:
+        errors.append(r.error)
+      else:
+        results.append(r.results)
+
+    return results, errors
+
+  @staticmethod
+  def send(uri):
+    '''
+    Performs the API request
+
+    - uri is the API uri we are going to ask.
+    '''
+    try:
+      result = urlopen(uri)
+    except:
+      raise RubygemsRequestError('Could not reach the rubygems API')
+
+    if result.status is not 200:
+      raise RubygemsRequestError('Rubygems API responded with error: {}'.format(result.reason))
+
+    try:
+      return parse(result.read().decode('utf8'))
+    except:
+      raise RubygemsRequestError('Rubygems API responded with invalid data')
+
+  def __init__(self, gem):
+    '''
+    Initializes the thread and sets the uri.
+
+    - gem is the gem we want some info about.
+    '''
+    super().__init__()
+    self._uri = RubygemsRequest.API.format(gem=gem)
+    self.results = {}
+    self.error = None
+
+  def run(self):
+    '''
+    Sends the request.
+    '''
+    try:
+      self.results = RubygemsRequest.send(self._uri)
+    except RubygemsRequestError as e:
+      self.error = e
+
+
+class PackageError(ArchgemsError):
+  '''
+  Handles package errors
+  '''
+  pass
+
+
+class Package:
+  '''
+  Handles Packages
+  '''
+
+  #: Name of the PKGBUILD file
+  PKGBUILD = 'PKGBUILD'
+
+  #: PKGBUILD template for rubygem packages
+  GEM_PKGBUILD = '''pkgname='ruby-{name}'
+pkgver='{version}'
+pkgrel=1
+pkgdesc='{info}'
+arch=(any)
+url='{url}'
+license=(MIT)
+depends=(ruby rubygems {depends})
+source='{source}'
+noextract=({file})
+
+build() {{
+  cd "$srcdir"
+  export HOME=/tmp
+  local _gemdir="$(ruby -rubygems -e'puts Gem.default_dir')"
+  gem install --no-user-install --ignore-dependencies -i \\
+      "${{pkgdir}}${{_gemdir}}" {file}
+}}'''
+
+  #: Path to a temporary dir
+  _tmpdir = None
+
+  @staticmethod
+  def tmpdir():
+    '''
+    Creates a temporary dir if needed and returns the path.
+    '''
+    if Package._tmpdir is None or not isdir(Package._tmpdir):
+      Package._tmpdir = mkdtemp(prefix='archgems-')
+
+    return Package._tmpdir
+
+  @staticmethod
+  def remove_tmpdir():
+    '''
+    Removes the temporary dir.
+    '''
+    try:
+      if Package._tmpdir is not None and isdir(Package._tmpdir):
+        rmtree(Package._tmpdir)
+    except (OSError, ShutilError):
+      pass
+
+  @staticmethod
+  def forge(name, version, gem_url, project_url, depends, info):
+    '''
+    Creates a PKGBUILD and tries to make a new gem package.
+
+    - name is the name of the gem
+    - version is the version of the gem
+    - gem_url is the source url of the gem
+    - project_url is the url of the project page
+    - depends is a list of dependencies
+    - info is a gem description
+    '''
+    builddir = join(Package.tmpdir(), name)
+
+    try:
+      if isdir(builddir):
+        rmtree(builddir)
+    except:
+      raise PackageError('Could not remove old build dir: {}'.format(builddir))
+
+    try:
+      makedirs(builddir, mode=0o700)
+    except OSError:
+      raise PackageError('Could not create build dir: {}'.format(builddir))
+
+    pkgbuild = join(builddir, Package.PKGBUILD)
+    depends = ' '.join(['ruby-{}'.format(gem) for gem in depends])
+    info = info if len(info) < 50 else info[:47] + '...'
+
+    try:
+      with open(pkgbuild, 'w') as f:
+        f.write(Package.GEM_PKGBUILD.format(name=name,
+                                            version=version,
+                                            info=info,
+                                            url=project_url,
+                                            depends=depends,
+                                            source=gem_url,
+                                            file=basename(gem_url)))
+    except OSError:
+      raise PackageError('Could not create PKGBUILD: {}'.format(pkgbuild))
+
+    try:
+      SysCall.makepkg(builddir)
+      path = next(iglob(join(builddir, '*.pkg.tar.xz')))
+      Log.store_buildlog(name, builddir)
+    except SysCallError as e:
+      raise PackageError('Could not make package: {}'.format(e.message))
+    except StopIteration:
+      raise PackageError('Could not find any package: {}'.format(builddir))
+    except LogError as e:
+      Log.log('[Err] {}'.format(e.message))
+
+    return Package(name, version, path)
+
+  def __init__(self, name, version, path):
+    '''
+    Sets some properties.
+
+    - name is the name of the package
+    - version is the version of the package
+    - path is the path to the package file
+    '''
+    self.name = name
+    self.version = version
+    self.path = path
+
+  def has_smaller_version_than(self, version):
+    '''
+    Compares the current package version with another one
+
+    - version is the version we want to compare with.
+    '''
+    try:
+      return LooseVersion(self.version) < LooseVersion(version)
+    except:
+      return self.version < version
+
+  def move(self, dst):
+    '''
+    Moves the package into a driectory.
+
+    - dst is the destination dir.
+    '''
+    dst = join(dst, basename(self.path))
+
+    try:
+      move(self.path, dst)
+      self.path = dst
+    except ShutilError:
+      raise PackageError('Could not move package: {} -> {}'.format(self.path, dst))
+
+  def destroy(self):
+    '''
+    Removes the package.
+    '''
+    try:
+      remove(self.path)
+      self.path = None
+    except OSError:
+      raise PackageError('Could not remove package: {}'.format(self.path))
+
+
+class RepoError(ArchgemsError):
+  '''
+  Handles repo errors
+  '''
+  pass
+
+
+class Repo:
+  '''
+  Handles Repos.
+  '''
+
+  #: Database extension
+  EXT = '.db.tar.gz'
+
+  #: Pattern matches info in '%KEY%\nval' style
+  DESC_PATTERN = compile_pattern('%([NAME|VERSION|FILENAME]+)%\n([^\n]+)\n')
+
+  #: Mandatory db fields
+  MANDATORY_FIELDS = ('name', 'version', 'filename')
+
+  @staticmethod
+  def parse_desc(desc):
+    '''
+    Parses a desc file from a repo database.
+
+    - desc is contents of the desc file
+    '''
+    info = {k.lower(): v for k, v in Repo.DESC_PATTERN.findall(desc)}
+
+    for f in Repo.MANDATORY_FIELDS:
+      if f not in info:
+        raise RepoError('Missing field: {}', f)
+
+    return info
+
+  def __init__(self, path, name):
+    '''
+    Sets some properties and loads the repo database.
+
+    - path is the path to the repo dir.
+    - name is the name of the repo.
+    '''
+    if not isdir(path):
+      raise RepoError('This is no directory: {}'.format(path))
+
+    self._db = join(path, name + Repo.EXT)
+    self._path = path
+    self.packages = self.load()
+
+  def __len__(self):
+    '''
+    Returns the number of packages in the repo
+    '''
+    return len(self.packages)
+
+  def __iter__(self):
+    '''
+    Returns an iterator over the packages dict
+    '''
+    return self.packages.__iter__()
+
+  def __getitem__(self, name):
+    '''
+    Returns a package specified by name
+    '''
+    return self.packages[name]
+
+  def __constains__(self, name):
+    '''
+    Checks if a package is in the repo
+    '''
+    return name in self.packages
+
+  def add(self, pkg):
+    '''
+    Adds a package to the repo.
+
+    - pkg is the package we want to add.
+    '''
+    if pkg.name in self:
+      self[pkg.name].destroy()
+
+    pkg.move(self._path)
+    self.packages[pkg.name] = pkg
+
+    try:
+      SysCall.repo_add(self._db, pkg.path)
+    except SysCallError as e:
+      raise RepoError('Could not add package to repo db: {}'.format(e.message))
+
+  def load(self):
+    '''
+    Loads the repo database and returns a package dict.
+    '''
+    if not isfile(self._db):
+      return {}
+
+    try:
+      db = open_tarfile(self._db)
+    except TarError:
+      raise RepoError('Could not open database: {}'.format(self._db))
+
+    packages = {}
+
+    for m in (m for m in db.getmembers() if m.isfile() and basename(m.name) == 'desc'):
+      try:
+        info = Repo.parse_desc(db.extractfile(m).read().decode('utf8'))
+      except RepoError as e:
+        raise RepoError('Invalid db entry: {}: {}'.format(m.name, e.message))
+      except:
+        raise RepoError('Could not read db entry: {}'.format(m.name))
+
+      name = info['name'][5:]        # Removing the 'ruby-' prefix
+      version = info['version'][:-2] # Removing the pkgrel '-1' suffix
+      path = join(self._path, info['filename'])
+      packages[name] = Package(name, version, path)
+
+    try:
+      db.close()
+    except TarError:
+      pass
+
+    return packages
+
+
+class Archgems:
+  '''
+  The main class of archgems
+  '''
+
+  #: A repo instance
+  _repo = None
+
+  @staticmethod
+  def init():
+    '''
+    Init all archgems tools.
+    '''
+    try:
+      Config.init()
+      Log.init()
+      Archgems._repo = Repo(Config.get('repo.path'), Config.get('repo.name'))
+    except ArchgemsError as e:
+      print('[Err] {}'.format(e.message))
+      Archgems.shutdown(1)
+
+  @staticmethod
+  def sync():
+    Log.log('[Msg] Starting a sync')
+    gems = {name for name in Archgems._repo}
+    gems.update(set(Config.get('repo.gems', [])))
+    todo = gems
+
+    while todo:
+      results, errors = RubygemsRequest.forge(todo)
+      todo = set()
+
+      for e in errors:
+        Log.log('[Err] {}'.format(e.message))
+
+      for gem in results:
+        try:
+          name = gem['name']
+          version = gem['version']
+          source = gem['gem_uri']
+          project = gem['project_uri']
+          depends = [d['name'] for d in gem['dependencies']['runtime']]
+          info = gem['info']
+        except KeyError:
+          Log.log('[Err] Rubygems responded with invalid data')
+          continue
+
+        if name not in Archgems._repo or Archgems._repo[name].has_smaller_version_than(version):
+          Log.log('[Msg] Forging gem: {} {}'.format(name, version))
+
+          try:
+            Archgems._repo.add(Package.forge(name, version, source, project, depends, info))
+            gems.add(name)
+          except ArchgemsError as e:
+            Log.log('[Err] {}'.format(e.message))
+
+        try:
+          todo.update({d for d in depends if d not in gems})
+        except KeyError:
+          pass
+
+  @staticmethod
+  def shutdown(status=0):
+    '''
+    Tidies up and exits with status.
+
+    - status is the exit status
+    '''
+    try:
+      Package.remove_tmpdir()
+      Log.close()
+    except ArchgemsError:
+      pass
+
+    exit(status)
+
+
+if __name__ == '__main__':
+  Archgems.init()
+  Archgems.sync()
+  Archgems.shutdown()
+
+# vim:ts=2:sw=2:et
